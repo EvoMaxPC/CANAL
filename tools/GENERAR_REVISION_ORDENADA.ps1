@@ -18,7 +18,6 @@ if (-not (Test-Path -LiteralPath $Ffprobe)) { throw "No se encontro ffprobe.exe:
 
 New-Item -ItemType Directory -Force -Path $OutputRoot | Out-Null
 
-# El orden es intencional: primero las carpetas 1, 2 y 3; la raiz queda al final.
 $Stages = @(
     [pscustomobject]@{ Name = "01_EVO_PARTES_01"; Path = (Join-Path $Repo "EVO_PARTES_01"); RootFiles = $false },
     [pscustomobject]@{ Name = "02_EVO_PARTES_02"; Path = (Join-Path $Repo "EVO_PARTES_02"); RootFiles = $false },
@@ -26,8 +25,8 @@ $Stages = @(
     [pscustomobject]@{ Name = "04_MP4_SUELTOS_RAIZ"; Path = $Repo; RootFiles = $true }
 )
 
-$GlobalSequence = 0
 $Summary = [System.Collections.Generic.List[string]]::new()
+$Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
 foreach ($Stage in $Stages) {
     Write-Host ""
@@ -58,7 +57,7 @@ foreach ($Stage in $Stages) {
     $StageOut = Join-Path $OutputRoot $Stage.Name
     New-Item -ItemType Directory -Force -Path $StageOut | Out-Null
     $TempDir = Join-Path $env:TEMP ("EVO_ORDERED_" + $Stage.Name)
-    if (Test-Path $TempDir) { Remove-Item -LiteralPath $TempDir -Recurse -Force }
+    if (Test-Path -LiteralPath $TempDir) { Remove-Item -LiteralPath $TempDir -Recurse -Force }
     New-Item -ItemType Directory -Force -Path $TempDir | Out-Null
 
     $StageManifest = [System.Collections.Generic.List[string]]::new()
@@ -67,14 +66,11 @@ foreach ($Stage in $Stages) {
 
     foreach ($Video in $Videos) {
         $LocalIndex++
-        $GlobalSequence++
         Write-Progress -Activity "Revision visual ordenada" -Status "$($Stage.Name): $LocalIndex / $($Videos.Count) - $($Video.Name)" -PercentComplete (($LocalIndex / $Videos.Count) * 100)
 
         $DurationText = & $Ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$($Video.FullName)"
         if ($LASTEXITCODE -ne 0 -or -not $DurationText) {
-            $Line = "{0:D3} | ERROR_METADATA | {1}" -f $LocalIndex, $Video.Name
-            $StageManifest.Add($Line)
-            $Summary.Add("$($Stage.Name) | ERROR metadata | $($Video.Name)")
+            $StageManifest.Add(("{0:D3} | ERROR_METADATA | {1}" -f $LocalIndex, $Video.Name))
             continue
         }
 
@@ -86,46 +82,51 @@ foreach ($Stage in $Stages) {
 
         $Midpoint = $Duration / 2
         $Stamp = $Midpoint.ToString("0.000", [Globalization.CultureInfo]::InvariantCulture)
-        $FramePath = Join-Path $TempDir ("frame_{0:D4}.jpg" -f $LocalIndex)
+        # Numeracion consecutiva de fotogramas validos para FFmpeg.
+        $FrameNumber = $Frames.Count + 1
+        $FramePath = Join-Path $TempDir ("frame_{0:D4}.jpg" -f $FrameNumber)
 
         & $Ffmpeg -hide_banner -loglevel error -ss $Stamp -i "$($Video.FullName)" -frames:v 1 -vf "scale=480:-2" -q:v 4 -y "$FramePath"
         if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $FramePath)) {
             $Frames.Add($FramePath)
-            $StageManifest.Add(("{0:D3} | {1:N2}s de {2:N2}s | {3}" -f $LocalIndex, $Midpoint, $Duration, $Video.Name))
+            $StageManifest.Add(("{0:D3} | CAPTURA {1:D4} | {2:N2}s de {3:N2}s | {4}" -f $LocalIndex, $FrameNumber, $Midpoint, $Duration, $Video.Name))
         } else {
             $StageManifest.Add(("{0:D3} | ERROR_FRAME | {1}" -f $LocalIndex, $Video.Name))
         }
     }
 
-    # Contact sheets de hasta 20 videos cada una, en el mismo orden de la carpeta.
+    # Listas concat UTF-8 sin BOM: evita el error de FFmpeg "unknown keyword '﻿file'".
     for ($Start = 0; $Start -lt $Frames.Count; $Start += $BatchSize) {
         $Batch = @($Frames | Select-Object -Skip $Start -First $BatchSize)
         $BatchNumber = [int]([Math]::Floor($Start / $BatchSize) + 1)
         $ListFile = Join-Path $TempDir ("batch_{0:D2}.txt" -f $BatchNumber)
-        $ConcatLines = foreach ($Frame in $Batch) {
+
+        $ConcatLines = @()
+        foreach ($Frame in $Batch) {
             $Escaped = $Frame.Replace('\', '/').Replace("'", "'\''")
-            "file '$Escaped'"
+            $ConcatLines += "file '$Escaped'"
         }
-        Set-Content -LiteralPath $ListFile -Value $ConcatLines -Encoding UTF8
+        [System.IO.File]::WriteAllLines($ListFile, [string[]]$ConcatLines, $Utf8NoBom)
 
         $Rows = [int][Math]::Ceiling($Batch.Count / [double]$Columns)
         $SheetPath = Join-Path $StageOut ("HOJA_{0:D2}.jpg" -f $BatchNumber)
         & $Ffmpeg -hide_banner -loglevel error -f concat -safe 0 -i "$ListFile" -vf "tile=$($Columns)x$($Rows):padding=10:margin=10:color=black" -frames:v 1 -q:v 3 -y "$SheetPath"
+
         if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $SheetPath)) {
-            Write-Host "Generada: $SheetPath" -ForegroundColor Green
+            Write-Host "HOJA GENERADA: $SheetPath" -ForegroundColor Green
         } else {
             Write-Warning "Fallo al crear $SheetPath"
         }
     }
 
-    $StageManifest | Set-Content -LiteralPath (Join-Path $StageOut "INDICE.txt") -Encoding UTF8
+    [System.IO.File]::WriteAllLines((Join-Path $StageOut "INDICE.txt"), [string[]]$StageManifest, $Utf8NoBom)
     $Summary.Add("$($Stage.Name) | $($Videos.Count) videos | $($Frames.Count) capturas | $($StageOut)")
     Remove-Item -LiteralPath $TempDir -Recurse -Force -ErrorAction SilentlyContinue
     Write-Host "ETAPA TERMINADA: $($Stage.Name) - $($Videos.Count) videos." -ForegroundColor Cyan
 }
 
 Write-Progress -Activity "Revision visual ordenada" -Completed
-$Summary | Set-Content -LiteralPath (Join-Path $OutputRoot "RESUMEN.txt") -Encoding UTF8
+[System.IO.File]::WriteAllLines((Join-Path $OutputRoot "RESUMEN.txt"), [string[]]$Summary, $Utf8NoBom)
 
 Write-Host ""
 Write-Host "REVISION ORDENADA TERMINADA" -ForegroundColor Green
